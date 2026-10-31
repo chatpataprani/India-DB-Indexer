@@ -1,30 +1,37 @@
 # India DB Indexer
 
-Phone-number index for a **verified synthetic SQLite dataset**. The indexer detects phone-like column names, preserves every column from each matching row, and writes exact-match records into hash-partitioned SQLite shards.
+A resumable, row-batched exact-phone indexer for a **verified synthetic SQLite dataset**. It detects phone-like column names, preserves every column from each matching row, and writes exact-match records into hash-partitioned SQLite shards.
 
-## Important storage requirement
+## Important storage and access requirement
 
-The source bucket is reported as approximately 438 GB. A standard GitHub-hosted runner does not have enough disk to download and index a database of that size. Run the indexing script on a machine/runner with the full source database available and sufficient additional disk for the generated index. The GitHub Actions workflow in this repository only validates the code; it does not download the database or run the 438 GB indexing job.
+The source bucket is reported as approximately 438 GB. Batch processing limits memory use and lets the job resume after interruption, but it does **not** remove the need for the machine to access the complete SQLite database. A standard GitHub-hosted runner does not have enough disk to download and index a database of this size.
 
-## Build the index
+Do not split a SQLite `.db` file into arbitrary byte chunks. SQLite tables must be read through SQLite itself. The current builder pages through rowid ranges. Tables declared `WITHOUT ROWID` are detected and stop the build safely; they need a primary-key pagination implementation before indexing.
 
-Make the synthetic SQLite database available locally as `users_data.db`, then:
+## Build or resume
+
+Make the source database available locally as `users_data.db`, then:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-DATASET_IS_SYNTHETIC=1 SOURCE_DB=users_data.db INDEX_DIR=index python scripts/build_index.py
+DATASET_IS_SYNTHETIC=1 SOURCE_DB=users_data.db INDEX_DIR=index BATCH_SIZE=2000 python scripts/build_index.py
 ```
 
 The script:
 - Opens the source database read-only.
+- Reads at most `BATCH_SIZE` rows at a time (default 2,000).
 - Detects columns named like phone, mobile, msisdn, contact, or cell.
-- Preserves all columns from each matching row.
-- Writes 256 hash-partitioned index files under `index/`.
-- Writes `index/manifest.json` with detected schema and build counts.
+- Preserves all source columns in each matching row's JSON payload.
+- Writes 256 hash-partitioned SQLite files under `index/`.
+- Commits shard writes before atomically saving `index/progress.json`.
+- Resumes from each table's last committed rowid when rerun.
+- Uses a unique source-row identity so a crash between shard commit and checkpoint does not duplicate entries.
 
-If your phone column uses a different name, update `PHONE_NAME` in `scripts/build_index.py` before running.
+Keep both the `index/` directory and `index/progress.json` between runs. Do not delete the progress file if you want to resume. To start a completely fresh build, move the entire old `index/` directory aside first. The new index format is not compatible with shards created by the earlier non-resumable script.
+
+If the phone column uses a different name, update `PHONE_NAME` in `scripts/build_index.py`.
 
 ## Run the API
 
@@ -39,11 +46,13 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 - `GET /health` — readiness check.
 - `GET /search?phone=9876543210` — exact phone lookup; requires header `X-API-Key: <API_KEY>`.
 
-The API returns all indexed source columns for each matching synthetic record, up to 1,000 matches per request. Keep the API authenticated and do not load real people's personal records into a public lookup service.
+The API returns the full indexed source row for each matching synthetic record, up to 1,000 results per request. Keep the API authenticated.
 
-## Notes
+## Current limitations
 
-- This is an exact-match index, not fuzzy search.
-- The source DB is never modified.
-- The index can be large because it stores the complete matching row payloads.
-- Test on a small synthetic sample first and compare returned rows with the source database before processing the full dataset.
+- This is exact-match search, not fuzzy search.
+- The source database is never modified.
+- Index files may be large because complete matching rows are preserved.
+- The current builder supports ordinary rowid tables; it intentionally stops on `WITHOUT ROWID` tables rather than silently skipping them.
+- This repository currently contains the indexer and API scaffolding; it does not yet download the bucket, upload generated shards, or run the full indexing job. Those steps require a verified bucket access/upload method and storage with enough capacity.
+- Test with a small synthetic database first and compare results against the source before attempting the full dataset.
