@@ -1,2 +1,4 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
+pyarrow>=19.0.0
+huggingface_hub>=0.32.0
