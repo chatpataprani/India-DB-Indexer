@@ -56,3 +56,32 @@ The API returns the full indexed source row for each matching synthetic record, 
 - The current builder supports ordinary rowid tables; it intentionally stops on `WITHOUT ROWID` tables rather than silently skipping them.
 - This repository currently contains the indexer and API scaffolding; it does not yet download the bucket, upload generated shards, or run the full indexing job. Those steps require a verified bucket access/upload method and storage with enough capacity.
 - Test with a small synthetic database first and compare results against the source before attempting the full dataset.
+
+
+## Vercel synthetic account-ID demo
+
+A separate demo route is available at `/search?account_id=TEST100001`. It reads only the tiny, bundled `data/synthetic_demo.json` fixture and returns only `account_id` and `phone` (plus lookup timing/source metadata). It does not read or import any external bucket data.
+
+Deploy this repository as a Vercel project with the repository root as the project root. The included `vercel.json` routes requests to `api/index.py`.
+
+Example requests:
+
+```text
+GET /
+GET /health
+GET /search?account_id=TEST100001
+```
+
+Only the ten TEST-prefixed fixture IDs are present. Unknown IDs return HTTP 404.
+
+### Local run
+
+```bash
+pip install -r requirements.txt
+uvicorn api.index:app --host 0.0.0.0 --port 8000
+python scripts/benchmark.py --url "http://127.0.0.1:8000/search?account_id=TEST100001" --requests 500
+```
+
+The benchmark measures end-to-end HTTP latency. The API's `lookup_ms` field measures only the in-memory dictionary lookup, not network time or cold starts. Millisecond performance is a target to measure, not a guarantee.
+
+The large Parquet bucket is deliberately not connected to this demo. Use clearly synthetic fixtures for load/performance testing; do not place real people's phone numbers in a public lookup service.
