@@ -23,7 +23,7 @@ PHONE_NAME = re.compile(r"(phone|mobile|msisdn|contact|cell)", re.I)
 
 
 def normalize(value):
-    digits = re.sub(r"\\D", "", str(value or ""))
+    digits = re.sub(r"\D", "", str(value or ""))
     if len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
     elif len(digits) == 11 and digits.startswith("0"):
