@@ -1,87 +1,71 @@
 # India DB Indexer
 
-A resumable, row-batched exact-phone indexer for a **verified synthetic SQLite dataset**. It detects phone-like column names, preserves every column from each matching row, and writes exact-match records into hash-partitioned SQLite shards.
+Fast exact-match API for `account_id` using your Hugging Face Parquet dataset.
 
-## Important storage and access requirement
+## Data source
 
-The source bucket is reported as approximately 438 GB. Batch processing limits memory use and lets the job resume after interruption, but it does **not** remove the need for the machine to access the complete SQLite database. A standard GitHub-hosted runner does not have enough disk to download and index a database of this size.
+The builder reads only the ten Parquet files directly inside:
 
-Do not split a SQLite `.db` file into arbitrary byte chunks. SQLite tables must be read through SQLite itself. The current builder pages through rowid ranges. Tables declared `WITHOUT ROWID` are detected and stop the build safely; they need a primary-key pagination implementation before indexing.
+`buckets/Chatpataprani/Hitek_ImCR_API-bucket/tg/processed/*.parquet`
 
-## Build or resume
+It selects only `account_id` and `phone`. It does not modify, rename, or delete any source Parquet file.
 
-Make the source database available locally as `users_data.db`, then:
+## How it works
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-DATASET_IS_SYNTHETIC=1 SOURCE_DB=users_data.db INDEX_DIR=index BATCH_SIZE=2000 python scripts/build_index.py
+1. GitHub Actions reads the ten source Parquet files through `HfFileSystem`.
+2. DuckDB scans the dataset in batches, assigns each numeric account ID to one of 1,024 hash shards, and sorts records by shard and account ID.
+3. The generated Parquet index is uploaded under `tg/processed/account-id-index/` in the same Hugging Face bucket.
+4. The manifest is uploaded last. The API considers the index ready only after that manifest exists.
+5. The API computes the shard for an incoming ID, reads only that shard, filters by exact `account_id`, and returns the two requested fields.
+
+The original source files remain read-only. Rebuilding replaces only files in the generated `account-id-index` output folder.
+
+## Build the index
+
+Add a Hugging Face **write** token as a GitHub Actions repository secret named `HF_TOKEN`. The token is used only by the workflow to read the source and write the generated index.
+
+Then open **GitHub → Actions → Build account ID Parquet index → Run workflow**.
+
+The workflow uses GitHub-hosted compute and may take a while to scan the full dataset. It does not run automatically on every push.
+
+## API
+
+After the index build finishes and the API is deployed:
+
+- `GET /` — service status
+- `GET /health` — index readiness
+- `GET /search?account_id=123456789` — exact lookup
+- `GET /docs` — interactive API documentation
+
+Successful response:
+
+```json
+{
+  "account_id": "123456789",
+  "phone": "+910000000000"
+}
 ```
 
-The script:
-- Opens the source database read-only.
-- Reads at most `BATCH_SIZE` rows at a time (default 2,000).
-- Detects columns named like phone, mobile, msisdn, contact, or cell.
-- Preserves all source columns in each matching row's JSON payload.
-- Writes 256 hash-partitioned SQLite files under `index/`.
-- Commits shard writes before atomically saving `index/progress.json`.
-- Resumes from each table's last committed rowid when rerun.
-- Uses a unique source-row identity so a crash between shard commit and checkpoint does not duplicate entries.
+The API returns only `account_id` and `phone`. It returns HTTP 404 when the ID is not found and HTTP 503 if the index is not ready.
 
-Keep both the `index/` directory and `index/progress.json` between runs. Do not delete the progress file if you want to resume. To start a completely fresh build, move the entire old `index/` directory aside first. The new index format is not compatible with shards created by the earlier non-resumable script.
+## Vercel environment variables
 
-If the phone column uses a different name, update `PHONE_NAME` in `scripts/build_index.py`.
+Set these in the Vercel project:
 
-## Run the API
+- `HF_TOKEN` — Hugging Face read token for the bucket
+- `HF_BUCKET` — optional; defaults to `buckets/Chatpataprani/Hitek_ImCR_API-bucket`
+- `INDEX_SHARDS` — optional; must match the builder, default `1024`
+- `CACHE_SIZE` — optional in-process lookup cache size, default `2048`
 
-Keep the generated `index/` directory available to the API server:
+Deploy this repository to Vercel using the repository root. The FastAPI entry point is `api/index.py`.
 
-```bash
-export API_KEY='replace-with-a-long-random-secret'
-export INDEX_DIR=index
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
+## Performance notes
 
-- `GET /health` — readiness check.
-- `GET /search?phone=9876543210` — exact phone lookup; requires header `X-API-Key: <API_KEY>`.
+Hash partitioning prevents a request from scanning all ten source files. A cold lookup still needs to access the relevant shard on Hugging Face; warm repeated IDs can be served from the process cache. Actual end-to-end latency depends on Vercel cold starts, network distance, Hugging Face storage, and shard size. Measure it after the index is built; millisecond response times are not guaranteed.
 
-The API returns the full indexed source row for each matching synthetic record, up to 1,000 results per request. Keep the API authenticated.
-
-## Current limitations
-
-- This is exact-match search, not fuzzy search.
-- The source database is never modified.
-- Index files may be large because complete matching rows are preserved.
-- The current builder supports ordinary rowid tables; it intentionally stops on `WITHOUT ROWID` tables rather than silently skipping them.
-- This repository currently contains the indexer and API scaffolding; it does not yet download the bucket, upload generated shards, or run the full indexing job. Those steps require a verified bucket access/upload method and storage with enough capacity.
-- Test with a small synthetic database first and compare results against the source before attempting the full dataset.
-
-
-## Vercel synthetic account-ID demo
-
-A separate demo route is available at `/search?account_id=TEST100001`. It reads only the tiny, bundled `data/synthetic_demo.json` fixture and returns only `account_id` and `phone` (plus lookup timing/source metadata). It does not read or import any external bucket data.
-
-Deploy this repository as a Vercel project with the repository root as the project root. The included `vercel.json` routes requests to `api/index.py`.
-
-Example requests:
-
-```text
-GET /
-GET /health
-GET /search?account_id=TEST100001
-```
-
-Only the ten TEST-prefixed fixture IDs are present. Unknown IDs return HTTP 404.
-
-### Local run
+## Development
 
 ```bash
 pip install -r requirements.txt
 uvicorn api.index:app --host 0.0.0.0 --port 8000
-python scripts/benchmark.py --url "http://127.0.0.1:8000/search?account_id=TEST100001" --requests 500
 ```
-
-The benchmark measures end-to-end HTTP latency. The API's `lookup_ms` field measures only the in-memory dictionary lookup, not network time or cold starts. Millisecond performance is a target to measure, not a guarantee.
-
-The large Parquet bucket is deliberately not connected to this demo. Use clearly synthetic fixtures for load/performance testing; do not place real people's phone numbers in a public lookup service.
